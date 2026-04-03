@@ -1,7 +1,9 @@
 package ai
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 )
 
 // ChatRequest is the provider-agnostic representation of what
@@ -31,4 +33,19 @@ type Provider interface {
 	// ParseResponse reads the provider-specific HTTP response body
 	// and extracts the model's text content.
 	ParseResponse(body []byte) (ChatResponse, error)
+}
+
+// ResolveProvider returns the Provider implementation for the given
+// provider name from config. Returns an error for unknown providers.
+func ResolveProvider(name string) (Provider, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "openai", "":
+		return OpenAI{}, nil
+	case "anthropic":
+		return Anthropic{}, nil
+	case "gemini":
+		return Gemini{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported provider %q: valid options are openai, anthropic, gemini", name)
+	}
 }
