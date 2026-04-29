@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"easy-cmd/internal/ai"
@@ -109,6 +110,18 @@ func TestClientRejectsWrongEnvelopeShape(t *testing.T) {
 	_, err := client.NextResponse(context.Background(), protocol.SessionContext{SessionID: "sess-1"})
 	if err == nil {
 		t.Fatal("expected wrong envelope shape to fail")
+	}
+}
+
+func TestClientRejectsMissingRuntimeConfig(t *testing.T) {
+	client := ai.New(config.Config{Model: "test-model"})
+
+	_, err := client.NextResponse(context.Background(), protocol.SessionContext{SessionID: "sess-1"})
+	if err == nil {
+		t.Fatal("expected missing runtime config to fail")
+	}
+	if !strings.Contains(err.Error(), "config.json") {
+		t.Fatalf("expected error to mention config.json, got %v", err)
 	}
 }
 

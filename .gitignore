@@ -24,9 +24,19 @@ profile.cov
 go.work
 go.work.sum
 
+# temp
+/tmp
+/docs
+
 # env file
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.cursor/
+.trae/
+.claude/
+
+# OS
+.DS_Store

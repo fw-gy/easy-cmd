@@ -11,7 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	contextengine "easy-cmd/internal/context"
+	"easy-cmd/internal/core"
 	"easy-cmd/internal/i18n"
 	"easy-cmd/internal/protocol"
 )
@@ -24,13 +24,11 @@ const (
 	ModeError   Mode = "error"
 )
 
-type Loader interface {
-	Load(ctx stdcontext.Context, session protocol.SessionContext) (contextengine.RunResult, error)
-}
-
+// Dependencies 通过注入方式传入，这样 Bubble Tea model 可以专注于
+// UI 状态本身，也更容易在测试里替换真实网络依赖。
 type Dependencies struct {
-	Loader       Loader
-	BaseSession  protocol.SessionContext
+	Runner       core.Runner
+	BaseRequest  core.Request
 	InitialQuery string
 	Language     string
 }
@@ -47,13 +45,13 @@ const (
 type transcriptItem struct {
 	Kind         transcriptItemKind
 	Text         string
-	Activity     *contextengine.Activity
+	Activity     *core.Activity
 	CommandGroup *commandGroup
 }
 
 type commandGroup struct {
 	ID         string
-	Candidates []protocol.CommandCandidate
+	Candidates []core.Candidate
 	Stale      bool
 }
 
@@ -63,7 +61,7 @@ type pendingConfirmation struct {
 }
 
 type turnLoadedMsg struct {
-	result contextengine.RunResult
+	result core.Result
 }
 
 type loadErrMsg struct {
@@ -72,6 +70,8 @@ type loadErrMsg struct {
 
 type loadingTickMsg struct{}
 
+// Model 是完整的 TUI 状态机。它负责维护输入框、已渲染的对话记录、
+// 当前激活的命令候选，以及本轮要发给逻辑层的一次性请求参数。
 type Model struct {
 	input                textinput.Model
 	viewport             viewport.Model
@@ -85,39 +85,56 @@ type Model struct {
 	lastError            error
 	catalog              i18n.Catalog
 	deps                 Dependencies
-	session              protocol.SessionContext
 	groupSequence        int
 	loadingFrame         int
 	width                int
 	height               int
 }
 
+// New 创建初始输入界面，此时对话记录为空，只保留稳定的基础请求参数。
+// 当 InitialQuery 非空时，会跳过输入等待阶段，直接进入加载状态。
 func New(deps Dependencies) Model {
 	catalog := i18n.NewCatalog(deps.Language)
 	input := textinput.New()
 	input.Placeholder = catalog.Text(i18n.KeyInputPlaceholder)
 	input.Focus()
-	input.SetValue(deps.InitialQuery)
 	input.Prompt = "› "
 
 	vp := viewport.New(0, 0)
 	vp.YPosition = 0
 
-	return Model{
+	m := Model{
 		input:    input,
 		viewport: vp,
 		mode:     ModeCompose,
 		status:   catalog.Text(i18n.KeyStatusReady),
 		catalog:  catalog,
 		deps:     deps,
-		session:  deps.BaseSession,
 	}
+
+	if query := strings.TrimSpace(deps.InitialQuery); query != "" {
+		m.transcript = append(m.transcript, transcriptItem{
+			Kind: itemUserMessage,
+			Text: query,
+		})
+		m.mode = ModeLoading
+		m.status = catalog.Text(i18n.KeyStatusAskingModel)
+	}
+
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
+	if query := strings.TrimSpace(m.deps.InitialQuery); query != "" {
+		request := m.deps.BaseRequest
+		request.Query = query
+		return tea.Batch(textinput.Blink, loadTurnCmd(m.deps.Runner, request), loadingTickCmd())
+	}
 	return textinput.Blink
 }
 
+// Update 是 Bubble Tea 的核心 reducer：窗口变化、按键输入、异步加载
+// 结果都会从这里流过，并产出下一份 model 状态。
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -148,6 +165,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// View 负责渲染当前对话内容，以及底部的输入框区域。
 func (m Model) View() string {
 	background := lipgloss.NewStyle().Background(lipgloss.Color("#1F202B")).Foreground(lipgloss.Color("#E8EAF1"))
 	frame := lipgloss.NewStyle().Padding(1, 2)
@@ -167,6 +185,8 @@ func (m Model) Output() protocol.AppOutput {
 	return m.output
 }
 
+// handleKey 把键盘输入映射成状态变化，并把全局快捷键和输入框自身的
+// 编辑行为区分开来。
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC:
@@ -174,6 +194,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case tea.KeyEsc:
 		if m.pendingConfirmation != nil {
+			// 按 ESC 时先取消额外确认状态，而不是直接执行更激进的动作，
+			// 比如退出程序。
 			m.pendingConfirmation = nil
 			m.status = m.catalog.Text(i18n.KeyStatusClearedConfirm)
 			m.syncViewport()
@@ -216,6 +238,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.mode == ModeLoading {
+		// 请求还在处理中时，忽略普通输入，避免 UI 状态与后台正在执行的
+		// 一次性逻辑请求发生偏离。
 		return m, nil
 	}
 
@@ -224,6 +248,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// handleEnter 在不同状态下有三种含义：
+// 1. 确认一个待确认的高风险命令
+// 2. 当输入框为空时，执行当前选中的候选命令
+// 3. 把新的自然语言请求发送给模型
 func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 	if m.pendingConfirmation != nil && strings.TrimSpace(m.input.Value()) == "" {
 		return m.confirmPendingSelection()
@@ -235,18 +263,16 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 	}
 
 	m.appendUserMessage(query)
-	m.session.UserQuery = query
-	m.session.Conversation = append(m.session.Conversation, protocol.ConversationMessage{
-		Role:    "user",
-		Content: query,
-	})
 	m.input.SetValue("")
 	m.mode = ModeLoading
 	m.loadingFrame = 0
 	m.status = m.catalog.Text(i18n.KeyStatusAskingModel)
 	m.lastError = nil
 	m.syncViewport()
-	return m, tea.Batch(loadTurnCmd(m.deps.Loader, m.session), loadingTickCmd())
+	// 并发启动模型请求和加载动画，让 UI 在后台等待时仍然保持响应。
+	request := m.deps.BaseRequest
+	request.Query = query
+	return m, tea.Batch(loadTurnCmd(m.deps.Runner, request), loadingTickCmd())
 }
 
 func (m *Model) appendUserMessage(query string) {
@@ -257,7 +283,9 @@ func (m *Model) appendUserMessage(query string) {
 	m.syncViewport()
 }
 
-func (m *Model) applyTurn(result contextengine.RunResult) {
+func (m *Model) applyTurn(result core.Result) {
+	// 新一轮 assistant 结果会使上一组命令失效。这样 UI 仍然能保留旧建议，
+	// 但不会再允许用户执行它们。
 	m.markActiveGroupStale()
 	for _, activity := range result.Activities {
 		activityCopy := activity
@@ -269,17 +297,13 @@ func (m *Model) applyTurn(result contextengine.RunResult) {
 
 	m.transcript = append(m.transcript, transcriptItem{
 		Kind: itemAssistantText,
-		Text: result.Turn.Message,
-	})
-	m.session.Conversation = append(m.session.Conversation, protocol.ConversationMessage{
-		Role:    "assistant",
-		Content: result.Turn.Message,
+		Text: result.Message,
 	})
 
 	groupID := m.nextGroupID()
 	group := commandGroup{
 		ID:         groupID,
-		Candidates: result.Turn.Candidates,
+		Candidates: result.Candidates,
 	}
 	m.transcript = append(m.transcript, transcriptItem{
 		Kind:         itemCommandGroup,
@@ -310,6 +334,8 @@ func (m *Model) markActiveGroupStale() {
 	m.pendingConfirmation = nil
 }
 
+// selectCandidate 会根据候选命令的本地风险等级，决定是直接结束，
+// 还是先进入待确认状态。
 func (m Model) selectCandidate(index int) (tea.Model, tea.Cmd) {
 	group := m.activeCommandGroup()
 	if group == nil || group.Stale || index < 0 || index >= len(group.Candidates) {
@@ -319,6 +345,8 @@ func (m Model) selectCandidate(index int) (tea.Model, tea.Cmd) {
 	m.selectedCandidate = index
 	candidate := group.Candidates[index]
 	if candidate.RequiresConfirmation {
+		// 高风险命令要求在空输入框上再按一次 Enter，避免用户本来只是想
+		// 输入下一句请求，却意外确认执行了命令。
 		m.pendingConfirmation = &pendingConfirmation{
 			GroupID:        group.ID,
 			CandidateIndex: index,
@@ -331,6 +359,8 @@ func (m Model) selectCandidate(index int) (tea.Model, tea.Cmd) {
 	return m.finishExecution(candidate.Command), tea.Quit
 }
 
+// confirmPendingSelection 只有在原先那组命令仍然处于激活状态时才会执行，
+// 从而避免新结果到来后，还去确认旧选择。
 func (m Model) confirmPendingSelection() (tea.Model, tea.Cmd) {
 	group := m.activeCommandGroup()
 	if group == nil || m.pendingConfirmation == nil {
@@ -344,6 +374,8 @@ func (m Model) confirmPendingSelection() (tea.Model, tea.Cmd) {
 	return m.finishExecution(group.Candidates[index].Command), tea.Quit
 }
 
+// moveSelection 会把键盘选择限制在当前激活的候选列表范围内，
+// 而不是循环跳转。
 func (m *Model) moveSelection(delta int) {
 	group := m.activeCommandGroup()
 	if group == nil || len(group.Candidates) == 0 {
@@ -359,6 +391,8 @@ func (m *Model) moveSelection(delta int) {
 	m.syncViewport()
 }
 
+// resizeViewport 会先计算输入框渲染后还剩多少垂直空间，再用它来调整
+// 可滚动对话区域的尺寸。
 func (m *Model) resizeViewport() {
 	transcriptWidth := m.width - 4
 	if transcriptWidth < 40 {
@@ -377,10 +411,14 @@ func (m *Model) syncViewport() {
 	if m.viewport.Width == 0 {
 		return
 	}
+	// viewport 总是跟随到最新内容，因为这个 UI 更偏向聊天流体验，
+	// 而不是强调手动恢复滚动位置。
 	m.viewport.SetContent(m.renderViewportContent())
 	m.viewport.GotoBottom()
 }
 
+// renderViewportContent 会把对话内容和临时状态行拼成一个整体字符串，
+// 交给 Bubble Tea 的 viewport 组件显示。
 func (m Model) renderViewportContent() string {
 	blocks := []string{m.renderTranscript()}
 	if inlineStatus := m.renderInlineStatus(); inlineStatus != "" {
@@ -389,6 +427,8 @@ func (m Model) renderViewportContent() string {
 	return strings.Join(blocks, "\n\n")
 }
 
+// renderTranscript 会遍历标准化后的 transcript item，并把每一类内容
+// 分发给对应的小渲染函数。
 func (m Model) renderTranscript() string {
 	if len(m.transcript) == 0 {
 		return m.renderEmptyState()
@@ -408,6 +448,7 @@ func (m Model) renderTranscript() string {
 	return strings.Join(blocks, "\n\n")
 }
 
+// renderEmptyState 用来显示用户还没发送任何请求时的初始欢迎界面。
 func (m Model) renderEmptyState() string {
 	wordmarkStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#EEF3FF")).
@@ -453,6 +494,8 @@ func (m Model) renderEmptyState() string {
 	)
 }
 
+// renderInlineStatus 只负责显示临时状态，这些内容应该出现在对话下方，
+// 而不是作为永久对话项写进 transcript。
 func (m Model) renderInlineStatus() string {
 	switch m.mode {
 	case ModeLoading:
@@ -494,7 +537,7 @@ func (m Model) renderUserMessage(text string) string {
 	return outer.Render(text)
 }
 
-func (m Model) renderActivity(activity contextengine.Activity) string {
+func (m Model) renderActivity(activity core.Activity) string {
 	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9BE38F")).Bold(true)
 	detailStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9AA3B5"))
 	lines := []string{
@@ -508,6 +551,8 @@ func (m Model) renderCommandGroup(group commandGroup) string {
 	return m.renderCommandGroupCard(group)
 }
 
+// renderCommandGroupCard 会把 assistant 返回的候选命令渲染成一张卡片。
+// 当旧卡片失效后，会在视觉上被弱化显示。
 func (m Model) renderCommandGroupCard(group commandGroup) string {
 	background := lipgloss.Color("#38384A")
 	foreground := lipgloss.Color("#E7EAF3")
@@ -590,12 +635,12 @@ func (m Model) finishExecution(command string) Model {
 	return m
 }
 
-func loadTurnCmd(loader Loader, session protocol.SessionContext) tea.Cmd {
+func loadTurnCmd(runner core.Runner, request core.Request) tea.Cmd {
 	return func() tea.Msg {
-		if loader == nil {
-			return loadErrMsg{err: fmt.Errorf("loader is not configured")}
+		if runner == nil {
+			return loadErrMsg{err: fmt.Errorf("runner is not configured")}
 		}
-		result, err := loader.Load(stdcontext.Background(), session)
+		result, err := runner.Run(stdcontext.Background(), request)
 		if err != nil {
 			return loadErrMsg{err: err}
 		}

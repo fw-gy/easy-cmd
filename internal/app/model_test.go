@@ -9,7 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	contextengine "easy-cmd/internal/context"
+	"easy-cmd/internal/core"
 	"easy-cmd/internal/protocol"
 )
 
@@ -23,33 +23,27 @@ func TestModelCtrlCCancelReturnsCancelOutput(t *testing.T) {
 }
 
 func TestSubmittingFollowupMarksPreviousCommandGroupStale(t *testing.T) {
-	loader := &stubLoader{
-		results: []contextengine.RunResult{
+	runner := &stubRunner{
+		results: []core.Result{
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "先看当前目录。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "ls -la", Summary: "list", RiskLevel: protocol.RiskLow},
-					},
+				Message: "先看当前目录。",
+				Candidates: []core.Candidate{
+					{Command: "ls -la", Summary: "list", RiskLevel: protocol.RiskLow},
 				},
-				Activities: []contextengine.Activity{
+				Activities: []core.Activity{
 					{Title: "Ran filesystem.list", Detail: "path=. depth=1"},
 				},
 			},
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "缩小到日志文件。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "find . -name '*.log'", Summary: "logs", RiskLevel: protocol.RiskLow},
-					},
+				Message: "缩小到日志文件。",
+				Candidates: []core.Candidate{
+					{Command: "find . -name '*.log'", Summary: "logs", RiskLevel: protocol.RiskLow},
 				},
 			},
 		},
 	}
 
-	model := New(Dependencies{Loader: loader})
+	model := New(Dependencies{Runner: runner})
 	model = submitPrompt(t, model, "先列目录")
 	firstGroupID := model.activeCommandGroupID
 	if firstGroupID == "" {
@@ -72,30 +66,24 @@ func TestSubmittingFollowupMarksPreviousCommandGroupStale(t *testing.T) {
 }
 
 func TestSelectingLatestCommandExecutesThatCommand(t *testing.T) {
-	loader := &stubLoader{
-		results: []contextengine.RunResult{
+	runner := &stubRunner{
+		results: []core.Result{
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "第一轮。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "ls -la", Summary: "list", RiskLevel: protocol.RiskLow},
-					},
+				Message: "第一轮。",
+				Candidates: []core.Candidate{
+					{Command: "ls -la", Summary: "list", RiskLevel: protocol.RiskLow},
 				},
 			},
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "第二轮。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "find . -name '*.log'", Summary: "logs", RiskLevel: protocol.RiskLow},
-					},
+				Message: "第二轮。",
+				Candidates: []core.Candidate{
+					{Command: "find . -name '*.log'", Summary: "logs", RiskLevel: protocol.RiskLow},
 				},
 			},
 		},
 	}
 
-	model := New(Dependencies{Loader: loader})
+	model := New(Dependencies{Runner: runner})
 	model = submitPrompt(t, model, "第一轮")
 	model = submitPrompt(t, model, "第二轮")
 
@@ -110,21 +98,18 @@ func TestSelectingLatestCommandExecutesThatCommand(t *testing.T) {
 }
 
 func TestHighRiskCandidateRequiresInlineConfirmation(t *testing.T) {
-	loader := &stubLoader{
-		results: []contextengine.RunResult{
+	runner := &stubRunner{
+		results: []core.Result{
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "这个命令会删除文件。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "rm -rf build", Summary: "remove build", RiskLevel: protocol.RiskHigh, RequiresConfirmation: true},
-					},
+				Message: "这个命令会删除文件。",
+				Candidates: []core.Candidate{
+					{Command: "rm -rf build", Summary: "remove build", RiskLevel: protocol.RiskHigh, RequiresConfirmation: true},
 				},
 			},
 		},
 	}
 
-	model := New(Dependencies{Loader: loader})
+	model := New(Dependencies{Runner: runner})
 	model = submitPrompt(t, model, "删除构建目录")
 
 	next, _ := model.Update(tea.KeyMsg{Runes: []rune{'1'}, Type: tea.KeyRunes})
@@ -144,21 +129,18 @@ func TestHighRiskCandidateRequiresInlineConfirmation(t *testing.T) {
 }
 
 func TestEscClearsConfirmationAndThenReturnsToConversation(t *testing.T) {
-	loader := &stubLoader{
-		results: []contextengine.RunResult{
+	runner := &stubRunner{
+		results: []core.Result{
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "危险操作。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "rm -rf build", Summary: "remove build", RiskLevel: protocol.RiskHigh, RequiresConfirmation: true},
-					},
+				Message: "危险操作。",
+				Candidates: []core.Candidate{
+					{Command: "rm -rf build", Summary: "remove build", RiskLevel: protocol.RiskHigh, RequiresConfirmation: true},
 				},
 			},
 		},
 	}
 
-	model := New(Dependencies{Loader: loader})
+	model := New(Dependencies{Runner: runner})
 	model = submitPrompt(t, model, "删掉构建目录")
 
 	next, _ := model.Update(tea.KeyMsg{Runes: []rune{'1'}, Type: tea.KeyRunes})
@@ -182,6 +164,49 @@ func TestEscClearsConfirmationAndThenReturnsToConversation(t *testing.T) {
 	}
 }
 
+func TestSubmittingFollowupUsesFreshOneShotRequest(t *testing.T) {
+	runner := &stubRunner{
+		results: []core.Result{
+			{
+				Message: "第一轮。",
+				Candidates: []core.Candidate{
+					{Command: "ls -la", Summary: "list", RiskLevel: protocol.RiskLow},
+				},
+			},
+			{
+				Message: "第二轮。",
+				Candidates: []core.Candidate{
+					{Command: "find . -name '*.log'", Summary: "logs", RiskLevel: protocol.RiskLow},
+				},
+			},
+		},
+	}
+
+	model := New(Dependencies{
+		Runner: runner,
+		BaseRequest: core.Request{
+			CWD:           "/repo",
+			WorkspaceRoot: "/repo",
+		},
+	})
+
+	model = submitPrompt(t, model, "先列目录")
+	model = submitPrompt(t, model, "只看日志")
+
+	if len(runner.requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(runner.requests))
+	}
+	if runner.requests[0].Query != "先列目录" {
+		t.Fatalf("unexpected first query %q", runner.requests[0].Query)
+	}
+	if runner.requests[1].Query != "只看日志" {
+		t.Fatalf("unexpected second query %q", runner.requests[1].Query)
+	}
+	if runner.requests[0].CWD != "/repo" || runner.requests[1].CWD != "/repo" {
+		t.Fatalf("expected base cwd to be preserved, got %#v", runner.requests)
+	}
+}
+
 func TestCommandCardRendersCandidateListInsideSingleCard(t *testing.T) {
 	model := New(Dependencies{})
 	model.width = 120
@@ -196,7 +221,7 @@ func TestCommandCardRendersCandidateListInsideSingleCard(t *testing.T) {
 			Kind: itemCommandGroup,
 			CommandGroup: &commandGroup{
 				ID: "group-1",
-				Candidates: []protocol.CommandCandidate{
+				Candidates: []core.Candidate{
 					{
 						Command:   "pwd",
 						Summary:   "显示当前工作目录",
@@ -241,7 +266,7 @@ func TestAssistantMessageIsNotRenderedInTranscript(t *testing.T) {
 			Kind: itemCommandGroup,
 			CommandGroup: &commandGroup{
 				ID: "group-1",
-				Candidates: []protocol.CommandCandidate{
+				Candidates: []core.Candidate{
 					{Command: "ls", Summary: "列出当前目录下的文件和文件夹", RiskLevel: protocol.RiskLow},
 				},
 			},
@@ -265,7 +290,7 @@ func TestPendingConfirmationExpandsInsideSelectedCandidate(t *testing.T) {
 			Kind: itemCommandGroup,
 			CommandGroup: &commandGroup{
 				ID: "group-1",
-				Candidates: []protocol.CommandCandidate{
+				Candidates: []core.Candidate{
 					{
 						Command:              "rm -rf build",
 						Summary:              "删除构建目录。",
@@ -286,21 +311,18 @@ func TestPendingConfirmationExpandsInsideSelectedCandidate(t *testing.T) {
 }
 
 func TestViewShowsInlineLoadingIndicatorAfterSubmittingPrompt(t *testing.T) {
-	loader := &stubLoader{
-		results: []contextengine.RunResult{
+	runner := &stubRunner{
+		results: []core.Result{
 			{
-				Turn: protocol.AssistantTurnEnvelope{
-					Type:    "assistant_turn",
-					Message: "这里是结果。",
-					Candidates: []protocol.CommandCandidate{
-						{Command: "ls", Summary: "列出文件", RiskLevel: protocol.RiskLow},
-					},
+				Message: "这里是结果。",
+				Candidates: []core.Candidate{
+					{Command: "ls", Summary: "列出文件", RiskLevel: protocol.RiskLow},
 				},
 			},
 		},
 	}
 
-	model := New(Dependencies{Loader: loader})
+	model := New(Dependencies{Runner: runner})
 	model.width = 120
 	model.height = 40
 	model.resizeViewport()
@@ -330,8 +352,8 @@ func TestViewShowsInlineLoadingIndicatorAfterSubmittingPrompt(t *testing.T) {
 }
 
 func TestViewShowsInlineErrorWithoutBottomStatus(t *testing.T) {
-	loader := &stubLoader{err: stdcontext.DeadlineExceeded}
-	model := New(Dependencies{Loader: loader})
+	runner := &stubRunner{err: stdcontext.DeadlineExceeded}
+	model := New(Dependencies{Runner: runner})
 	model.width = 120
 	model.height = 40
 	model.resizeViewport()
@@ -407,7 +429,7 @@ func TestViewportContentUsesCompactSpacingBetweenUserMessageAndCommandGroup(t *t
 			Kind: itemCommandGroup,
 			CommandGroup: &commandGroup{
 				ID: "group-1",
-				Candidates: []protocol.CommandCandidate{
+				Candidates: []core.Candidate{
 					{Command: "ls", Summary: "列出当前目录", RiskLevel: protocol.RiskLow},
 				},
 			},
@@ -485,7 +507,7 @@ func TestPendingConfirmationUsesEnglishWhenConfigured(t *testing.T) {
 			Kind: itemCommandGroup,
 			CommandGroup: &commandGroup{
 				ID: "group-1",
-				Candidates: []protocol.CommandCandidate{
+				Candidates: []core.Candidate{
 					{
 						Command:              "rm -rf build",
 						Summary:              "Remove build output.",
@@ -505,6 +527,65 @@ func TestPendingConfirmationUsesEnglishWhenConfigured(t *testing.T) {
 	assertNotContains(t, rendered, "按 Enter 确认执行，按 Esc 取消")
 }
 
+func TestInitialQueryAutoSubmitsWithoutEnter(t *testing.T) {
+	runner := &stubRunner{
+		results: []core.Result{
+			{
+				Message: "列出当前目录。",
+				Candidates: []core.Candidate{
+					{Command: "ls -la", Summary: "list files", RiskLevel: protocol.RiskLow},
+				},
+			},
+		},
+	}
+
+	model := New(Dependencies{
+		Runner: runner,
+		BaseRequest: core.Request{
+			CWD:           "/repo",
+			WorkspaceRoot: "/repo",
+		},
+		InitialQuery: "列出文件",
+	})
+
+	if model.mode != ModeLoading {
+		t.Fatalf("expected loading mode after auto-submit, got %q", model.mode)
+	}
+	if model.input.Value() != "" {
+		t.Fatalf("expected input to be empty after auto-submit, got %q", model.input.Value())
+	}
+	if len(model.transcript) != 1 || model.transcript[0].Text != "列出文件" {
+		t.Fatalf("expected user message in transcript, got %+v", model.transcript)
+	}
+
+	cmd := model.Init()
+	if cmd == nil {
+		t.Fatal("expected Init to return async commands")
+	}
+
+	model = applyCmdMessages(t, model, cmd, func(msg tea.Msg) bool {
+		_, ok := msg.(turnLoadedMsg)
+		return ok
+	})
+
+	if model.mode != ModeCompose {
+		t.Fatalf("expected compose mode after result, got %q", model.mode)
+	}
+	if len(runner.requests) != 1 || runner.requests[0].Query != "列出文件" {
+		t.Fatalf("expected one request with initial query, got %+v", runner.requests)
+	}
+}
+
+func TestInitialQueryWhitespaceOnlyDoesNotAutoSubmit(t *testing.T) {
+	model := New(Dependencies{InitialQuery: "   "})
+	if model.mode != ModeCompose {
+		t.Fatalf("expected compose mode for whitespace-only query, got %q", model.mode)
+	}
+	if len(model.transcript) != 0 {
+		t.Fatalf("expected empty transcript for whitespace-only query, got %d items", len(model.transcript))
+	}
+}
+
 func TestResizeViewportAccountsForComposerHeight(t *testing.T) {
 	model := New(Dependencies{})
 	model.width = 120
@@ -517,19 +598,19 @@ func TestResizeViewportAccountsForComposerHeight(t *testing.T) {
 	}
 }
 
-type stubLoader struct {
-	results  []contextengine.RunResult
+type stubRunner struct {
+	results  []core.Result
 	err      error
-	sessions []protocol.SessionContext
+	requests []core.Request
 }
 
-func (s *stubLoader) Load(_ stdcontext.Context, session protocol.SessionContext) (contextengine.RunResult, error) {
-	s.sessions = append(s.sessions, session)
+func (s *stubRunner) Run(_ stdcontext.Context, request core.Request) (core.Result, error) {
+	s.requests = append(s.requests, request)
 	if s.err != nil {
-		return contextengine.RunResult{}, s.err
+		return core.Result{}, s.err
 	}
 	if len(s.results) == 0 {
-		return contextengine.RunResult{}, nil
+		return core.Result{}, nil
 	}
 	result := s.results[0]
 	s.results = s.results[1:]

@@ -2,28 +2,52 @@ package shell_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"testing"
-
-	"easy-cmd/internal/protocol"
 )
 
-func TestShellBridgeDoesNotExecuteOnCancelOrMalformedOutput(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "marker")
-	binary := filepath.Join(dir, "stub.sh")
-	script := "#!/bin/zsh\nprint '{\"action\":\"cancel\"}'\n"
-	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+// writeInstalledEasyCmdStub 在 $HOME/.local/bin/easy-cmd 写入可执行脚本，与桥接脚本固定解析路径一致。
+func writeInstalledEasyCmdStub(t *testing.T, home string, script string) {
+	t.Helper()
+	bin := filepath.Join(home, ".local", "bin", "easy-cmd")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
+}
 
-	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; EASY_CMD_BIN="+binary+"; easy-cmd")
+func TestEmbeddedShellScriptMatchesSourceBridgeScript(t *testing.T) {
+	sourcePath := filepath.Join("..", "shell", "easy-cmd.zsh")
+	embeddedPath := filepath.Join("..", "cmd", "easy-cmd", "assets", "easy-cmd.zsh")
+
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("ReadFile source script failed: %v", err)
+	}
+	embedded, err := os.ReadFile(embeddedPath)
+	if err != nil {
+		t.Fatalf("ReadFile embedded script failed: %v", err)
+	}
+
+	if !bytes.Equal(source, embedded) {
+		t.Fatalf("expected %s and %s to stay in sync", sourcePath, embeddedPath)
+	}
+}
+
+func TestShellBridgeDoesNotExecuteOnCancelOrMalformedOutput(t *testing.T) {
+	home := t.TempDir()
+	marker := filepath.Join(home, "marker")
+	script := "#!/bin/zsh\nexit 0\n"
+	writeInstalledEasyCmdStub(t, home, script)
+
+	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; easy-cmd")
 	cmd.Dir = filepath.Join("..")
-	cmd.Env = append(os.Environ(), "MARKER="+marker)
+	cmd.Env = append(os.Environ(), "HOME="+home, "MARKER="+marker)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("shell command failed: %v\n%s", err, out)
 	}
@@ -33,24 +57,13 @@ func TestShellBridgeDoesNotExecuteOnCancelOrMalformedOutput(t *testing.T) {
 }
 
 func TestShellBridgePrintsSelectedCommandWithoutExecuting(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "marker")
-	payload, _ := json.Marshal(protocol.AppOutput{
-		Action:          protocol.ActionExecute,
-		SelectedCommand: "touch " + marker,
-	})
+	home := t.TempDir()
+	marker := filepath.Join(home, "marker")
+	writeInstalledEasyCmdStub(t, home, "#!/bin/zsh\nprint 'touch "+marker+"'\n")
 
-	binary := filepath.Join(dir, "stub.sh")
-	var buf bytes.Buffer
-	buf.WriteString("#!/bin/zsh\nprint '")
-	buf.Write(payload)
-	buf.WriteString("'\n")
-	if err := os.WriteFile(binary, buf.Bytes(), 0o755); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; EASY_CMD_BIN="+binary+"; easy-cmd")
+	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; easy-cmd")
 	cmd.Dir = filepath.Join("..")
+	cmd.Env = append(os.Environ(), "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("shell command failed: %v\n%s", err, out)
@@ -64,25 +77,14 @@ func TestShellBridgePrintsSelectedCommandWithoutExecuting(t *testing.T) {
 }
 
 func TestShellWidgetRefillsBufferWithoutExecuting(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "marker")
+	home := t.TempDir()
+	marker := filepath.Join(home, "marker")
 	selectedCommand := "touch " + marker
-	payload, _ := json.Marshal(protocol.AppOutput{
-		Action:          protocol.ActionExecute,
-		SelectedCommand: selectedCommand,
-	})
+	writeInstalledEasyCmdStub(t, home, "#!/bin/zsh\nprint '"+selectedCommand+"'\n")
 
-	binary := filepath.Join(dir, "stub.sh")
-	var buf bytes.Buffer
-	buf.WriteString("#!/bin/zsh\nprint '")
-	buf.Write(payload)
-	buf.WriteString("'\n")
-	if err := os.WriteFile(binary, buf.Bytes(), 0o755); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; function zle(){ :; }; EASY_CMD_BIN="+binary+"; BUFFER='list files'; easy-cmd-widget; print -r -- \"$BUFFER\"; print -r -- \"$CURSOR\"")
+	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; function zle(){ :; }; BUFFER='list files'; easy-cmd-widget; print -r -- \"$BUFFER\"; print -r -- \"$CURSOR\"")
 	cmd.Dir = filepath.Join("..")
+	cmd.Env = append(os.Environ(), "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("shell command failed: %v\n%s", err, out)
@@ -104,15 +106,13 @@ func TestShellWidgetRefillsBufferWithoutExecuting(t *testing.T) {
 }
 
 func TestShellBridgePassesInitSubcommandThroughToBinary(t *testing.T) {
-	dir := t.TempDir()
-	binary := filepath.Join(dir, "stub.sh")
+	home := t.TempDir()
 	script := "#!/bin/zsh\nprint 'source /tmp/easy-cmd.zsh'\n"
-	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
+	writeInstalledEasyCmdStub(t, home, script)
 
-	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; EASY_CMD_BIN="+binary+"; easy-cmd init zsh")
+	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; easy-cmd init")
 	cmd.Dir = filepath.Join("..")
+	cmd.Env = append(os.Environ(), "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("shell command failed: %v\n%s", err, out)
@@ -123,16 +123,14 @@ func TestShellBridgePassesInitSubcommandThroughToBinary(t *testing.T) {
 }
 
 func TestShellBridgePassesQueryAsSeparateArgument(t *testing.T) {
-	dir := t.TempDir()
-	argsFile := filepath.Join(dir, "args.txt")
-	binary := filepath.Join(dir, "stub.sh")
-	script := "#!/bin/zsh\n: > " + argsFile + "\nfor arg in \"$@\"; do\n  print -r -- \"$arg\" >> " + argsFile + "\ndone\nprint '{\"action\":\"cancel\"}'\n"
-	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
+	home := t.TempDir()
+	argsFile := filepath.Join(home, "args.txt")
+	script := "#!/bin/zsh\n: > " + argsFile + "\nfor arg in \"$@\"; do\n  print -r -- \"$arg\" >> " + argsFile + "\ndone\nexit 0\n"
+	writeInstalledEasyCmdStub(t, home, script)
 
-	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; EASY_CMD_BIN="+binary+"; easy-cmd '列出当前目录下的文件'")
+	cmd := exec.Command("zsh", "-lc", "source ./shell/easy-cmd.zsh; easy-cmd '列出当前目录下的文件'")
 	cmd.Dir = filepath.Join("..")
+	cmd.Env = append(os.Environ(), "HOME="+home)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("shell command failed: %v\n%s", err, out)
@@ -145,6 +143,9 @@ func TestShellBridgePassesQueryAsSeparateArgument(t *testing.T) {
 	lines := bytes.Split(bytes.TrimSpace(rawArgs), []byte("\n"))
 	if len(lines) == 0 {
 		t.Fatalf("expected forwarded args, got %q", rawArgs)
+	}
+	if !bytes.Equal(lines[0], []byte("pick")) {
+		t.Fatalf("expected shell bridge to call pick subcommand, got %q", rawArgs)
 	}
 	if !bytes.Contains(rawArgs, []byte("--query")) {
 		t.Fatalf("expected --query flag in args, got %q", rawArgs)

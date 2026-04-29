@@ -11,7 +11,7 @@ import (
 )
 
 func TestEngineStopsOnCandidates(t *testing.T) {
-	client := stubClient{
+	client := &stubClient{
 		responses: []string{
 			`{"type":"assistant_turn","message":"Use ls.","candidates":[{"command":"ls","summary":"list","risk_level":"low","requires_confirmation":false}]}`,
 		},
@@ -33,7 +33,7 @@ func TestEngineStopsOnCandidates(t *testing.T) {
 }
 
 func TestEngineEnforcesRequestLimits(t *testing.T) {
-	client := stubClient{
+	client := &stubClient{
 		responses: []string{
 			`{"type":"context_request","requests":[
 				{"id":"1","provider":"filesystem.list","args":{"path":"."},"reason":"a"},
@@ -52,7 +52,7 @@ func TestEngineEnforcesRequestLimits(t *testing.T) {
 }
 
 func TestEngineRejectsUnknownProvider(t *testing.T) {
-	client := stubClient{
+	client := &stubClient{
 		responses: []string{
 			`{"type":"context_request","requests":[{"id":"1","provider":"unknown","args":{},"reason":"inspect"}]}`,
 		},
@@ -80,7 +80,7 @@ func TestEngineRejectsProviderArgValidationErrors(t *testing.T) {
 		return map[string]any{"path": args.Path}, nil
 	}))
 
-	client := stubClient{
+	client := &stubClient{
 		responses: []string{
 			`{"type":"context_request","requests":[{"id":"1","provider":"filesystem.list","args":{},"reason":"inspect"}]}`,
 		},
@@ -93,12 +93,59 @@ func TestEngineRejectsProviderArgValidationErrors(t *testing.T) {
 	}
 }
 
+func TestEngineReturnsProviderFailuresInCollectedContext(t *testing.T) {
+	registry := contextengine.Registry{}
+	registry.Register("filesystem.list", contextengine.ProviderFunc(func(ctx stdcontext.Context, session protocol.SessionContext, raw json.RawMessage) (any, error) {
+		return map[string]any{"path": "."}, nil
+	}))
+	registry.Register("git.status", contextengine.ProviderFunc(func(ctx stdcontext.Context, session protocol.SessionContext, raw json.RawMessage) (any, error) {
+		return nil, errors.New("git unavailable")
+	}))
+
+	client := &stubClient{
+		responses: []string{
+			`{"type":"context_request","requests":[
+				{"id":"1","provider":"filesystem.list","args":{"path":"."},"reason":"inspect files"},
+				{"id":"2","provider":"git.status","args":{},"reason":"inspect git status"}
+			]}`,
+			`{"type":"assistant_turn","message":"Use ls.","candidates":[{"command":"ls","summary":"list","risk_level":"low","requires_confirmation":false}]}`,
+		},
+	}
+
+	engine := contextengine.NewEngine(registry, client, contextengine.Options{MaxRounds: 3, MaxRequestsPerRound: 3})
+	result, err := engine.Run(stdcontext.Background(), protocol.SessionContext{SessionID: "sess-1", UserQuery: "list files", CWD: "."})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if len(result.Activities) != 2 {
+		t.Fatalf("expected 2 activities, got %d", len(result.Activities))
+	}
+	if len(client.sessions) != 2 {
+		t.Fatalf("expected 2 client calls, got %d", len(client.sessions))
+	}
+	secondSession := client.sessions[1]
+	if len(secondSession.CollectedContext) != 2 {
+		t.Fatalf("expected 2 collected context results, got %d", len(secondSession.CollectedContext))
+	}
+	if !secondSession.CollectedContext[0].OK {
+		t.Fatal("expected first provider call to succeed")
+	}
+	if secondSession.CollectedContext[1].OK {
+		t.Fatal("expected second provider call to fail")
+	}
+	if secondSession.CollectedContext[1].Error == "" {
+		t.Fatal("expected failed provider result to contain an error")
+	}
+}
+
 type stubClient struct {
 	responses []string
 	index     int
+	sessions  []protocol.SessionContext
 }
 
-func (s stubClient) NextResponse(stdcontext.Context, protocol.SessionContext) ([]byte, error) {
+func (s *stubClient) NextResponse(_ stdcontext.Context, session protocol.SessionContext) ([]byte, error) {
+	s.sessions = append(s.sessions, session)
 	if s.index >= len(s.responses) {
 		return nil, errors.New("no response configured")
 	}

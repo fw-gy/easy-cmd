@@ -42,8 +42,7 @@ func New(cfg config.Config) *Client {
 	}
 }
 
-// NextResponse 会把完整会话序列化为 JSON，发送到配置好的
-// chat-completions 风格接口，并返回一个已经过校验的协议信封。
+// NextResponse 会把完整会话序列化为 JSON，发送到配置好的 AI 接口，并返回一个已经过校验的协议信封。
 func (c *Client) NextResponse(ctx context.Context, session protocol.SessionContext) ([]byte, error) {
 	if err := c.validateRuntimeConfig(); err != nil {
 		return nil, err

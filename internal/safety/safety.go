@@ -8,6 +8,8 @@ import (
 )
 
 var (
+	// 高风险模式对应可能删除数据、覆盖文件或需要更高权限的命令。
+	// 这类命令一律要求显式确认。
 	highPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(^|\s)sudo(\s|$)`),
 		regexp.MustCompile(`(^|\s)rm(\s|$)`),
@@ -17,12 +19,16 @@ var (
 		regexp.MustCompile(`(^|\s)mv\s+.*\s+-f(\s|$)`),
 		regexp.MustCompile(`(^|\s)cp\s+.*\s+-f(\s|$)`),
 	}
+	// 中风险模式对应会修改状态、或把多条命令串起来执行的情况，
+	// 用户通常没法一眼看清它的影响。
 	mediumPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`&&|\|\||\|`),
 		regexp.MustCompile(`(^|\s)(mv|cp)(\s|$)`),
 	}
 )
 
+// Classify 会给模型生成的命令补一个本地安全标签。
+// 这样即使模型低估了风险，最终风险判断也仍然是确定的。
 func Classify(candidate protocol.CommandCandidate) protocol.CommandCandidate {
 	command := strings.TrimSpace(candidate.Command)
 	switch {
@@ -56,6 +62,8 @@ func matchesAny(command string, patterns []*regexp.Regexp) bool {
 	return false
 }
 
+// looksReadOnly 的策略是故意保守的：只有很小的一组白名单会被判成
+// “低风险”，其他命令除非命中更危险的规则，否则都回落到中风险。
 func looksReadOnly(command string) bool {
 	for _, prefix := range []string{"ls", "cat", "find", "rg", "grep", "git status", "git branch", "pwd"} {
 		if strings.HasPrefix(command, prefix) {

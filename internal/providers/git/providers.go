@@ -15,6 +15,8 @@ import (
 type branchProvider struct{}
 type statusProvider struct{}
 
+// Register 只向模型暴露很小的一部分 git 信息：当前分支和 porcelain
+// 状态，两者都限制在当前工作区根目录下。
 func Register(registry contextengine.Registry) contextengine.Registry {
 	registry.Register("git.branch", branchProvider{})
 	registry.Register("git.status", statusProvider{})
@@ -30,6 +32,8 @@ func (branchProvider) Run(ctx stdcontext.Context, session protocol.SessionContex
 		root = session.CWD
 	}
 
+	// `git branch --show-current` 对大多数依赖分支信息的场景已经足够，
+	// 同时默认不暴露提交历史或 diff 内容。
 	out, err := exec.CommandContext(ctx, "git", "-C", root, "branch", "--show-current").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("git branch: %w", err)
@@ -51,6 +55,8 @@ func (statusProvider) Run(ctx stdcontext.Context, session protocol.SessionContex
 		return nil, fmt.Errorf("git status: %w", err)
 	}
 
+	// porcelain 输出的第一行是分支元信息，后面的每一行才是文件状态，
+	// 用来描述修改、新增或未跟踪文件。
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	result := map[string]any{
 		"branch":  "",
